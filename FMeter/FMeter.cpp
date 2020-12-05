@@ -1,4 +1,10 @@
-﻿
+﻿/*!
+\file
+\brief Main file with demo application
+
+Almost done in C++, but irq processing and command parser in c-lang
+*/
+
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -13,27 +19,43 @@ using namespace std;
 
 // we need at least ten samples for the max freq 1kHz
 // and enougth space for the longest signal record
-#define ADC_BUF_SIZE (1024*16)
-#define CLOCK_PER_SEC (10000)
+#define ADC_BUF_SIZE (1024*1024*16)
+#define CLOCK_PER_SEC (1000000)
 
 // at least half period from the max freq
 #define SURGE_GUARD_CNT (10)
 
-int AdcBuf[ADC_BUF_SIZE];
-unsigned LastIdx = 0;
+int16_t AdcBuf[ADC_BUF_SIZE];
+uint32_t LastIdx = 0;
 // amplitude detection with filtering possibilities
-int MaxVal = 0;
-int MinVal = 0;
+int16_t MaxVal = 0;
+int16_t MinVal = 0;
 // edge detecting algorithm with cached values
-unsigned EdgeUpCnt = 0;
-unsigned EdgeDnCnt = 0;
-unsigned LastEdgeUpCnt = 0;
-unsigned LastEdgeDnCnt = 0;
-int PrevSmpl = 0;
+uint32_t EdgeUpCnt = 0;
+uint32_t EdgeDnCnt = 0;
+uint32_t LastEdgeUpCnt = 0;
+uint32_t LastEdgeDnCnt = 0;
+int16_t PrevSmpl = 0;
 
-void ADC_IRQ(int Sample)
+// multipulse frequency measurements for HF
+// for demonstration only rire pulse is counted
+uint32_t MultiEdgeUpCnt = 0;
+uint32_t LastMultiEdgeUpCnt = 0;
+#define MULTI_COUNT_TOTAL (10)
+
+// frequency measurements by counting pulse per second
+// for demonstration only risind edge is processed
+uint32_t OneSecPulseCnt = 0;
+uint32_t UpEdgePerSecCnt = 0;
+uint32_t LastUpEdgePerSecCnt = 0;
+
+/*!
+IRQ processing call
+\param[in] Sample zerr0-based value from ADC without DC biasing
+*/
+void ADC_IRQ(int16_t Sample)
 {
-    unsigned NxtLastIdx = (LastIdx+1) % ADC_BUF_SIZE;
+    uint32_t NxtLastIdx = (LastIdx+1) % ADC_BUF_SIZE;
     AdcBuf[NxtLastIdx] = Sample;
 
     // some statistic will counted here
@@ -52,6 +74,7 @@ void ADC_IRQ(int Sample)
         if (EdgeUpCnt > SURGE_GUARD_CNT) {
             LastEdgeUpCnt = EdgeUpCnt;
             EdgeUpCnt = 0;
+            ++UpEdgePerSecCnt;
         }
     }
     else {
@@ -69,23 +92,43 @@ void ADC_IRQ(int Sample)
         ++EdgeDnCnt;
     }
 
+    //pulse-per-sec
+    if (OneSecPulseCnt != CLOCK_PER_SEC) {
+        ++OneSecPulseCnt;
+    }
+    else {
+        LastUpEdgePerSecCnt = UpEdgePerSecCnt;
+        UpEdgePerSecCnt = 0;
+        OneSecPulseCnt = 0;
+    }
+
     PrevSmpl = Sample;
     LastIdx = NxtLastIdx;
 };
 
-int GetFreq() {
-    // just for certancy increasing
-    int MidleCnt = (LastEdgeUpCnt + LastEdgeDnCnt) / 2;
+
+/*!
+Calculation of inverce period from the last detected pulse
+*/
+int32_t GetFreq() {
     // float is impossible according to technical requrements
-    int Freq = 0;
-    if (MidleCnt == 0) {
+    int32_t Freq = 0;
+    if ((LastEdgeUpCnt == 0) or (LastEdgeDnCnt == 0)) {
         // there are no valid measurements
         return 0;
     }
     else {
-        Freq = CLOCK_PER_SEC / MidleCnt;
-
+        // just for certancy increasing
+        Freq = CLOCK_PER_SEC*2 / (LastEdgeDnCnt + LastEdgeUpCnt);
     }
+    return Freq;
+}
+
+/*!
+Calculation by direct measurements of pulse per second
+*/
+int32_t GetFreqFromPulse() {
+    int32_t Freq = LastUpEdgePerSecCnt;
     return Freq;
 }
 
@@ -96,20 +139,35 @@ enum ECmdState {eStart, eCode, eStop} ;
 #define START_SMBL (':')
 #define STOP_SMBL (0x0A)
 
-#define CMD_EXIT        (0) 
-#define CMD_GET_FREQ    (1) 
-#define CMD_GET_ADC     (2)
+#define CMD_EXIT            (0) 
+#define CMD_GET_FREQ        (1) 
+#define CMD_GET_FREQ_SEC    (2) 
+#define CMD_GET_ADC         (3)
 
 
+
+/*!
+Get frequency value command processing
+*/
 void GetFreqCmd() {
     cout << GetFreq() << endl;
 }
 
+/*!
+Get frequency value command processing
+*/
+void GetPulseCntFreqCmd() {
+    cout << GetFreqFromPulse() << endl;
+}
+
+/*!
+Get samples command processing
+*/
 void GetAdcCmd() {
     // Calc of start Idx for tx
-    unsigned CntTotal = max(LastEdgeUpCnt, LastEdgeDnCnt);
+    uint32_t CntTotal = max(LastEdgeUpCnt, LastEdgeDnCnt);
 
-    int StartIdx = 0;
+    uint32_t StartIdx = 0;
     // logic is clear instead of logic operaton
     if (CntTotal > LastIdx) {
         // starts from the end of Buf
@@ -119,8 +177,8 @@ void GetAdcCmd() {
         StartIdx = LastIdx - CntTotal;
     }
 
-    int Cnt = 0;
-    int CurIdx = StartIdx;
+    uint32_t Cnt = 0;
+    uint32_t CurIdx = StartIdx;
     cout << hex;
     while (Cnt < CntTotal) {
         int16_t Sample = AdcBuf[CurIdx];
@@ -134,12 +192,16 @@ void GetAdcCmd() {
     return;
 };
 
-int CmdProcessor(char* Buf, int Len) {
-    int Cnt = 0;
+/*!
+Protocol parser implimentation
+Only one cmd in time is supported at now
+*/
+int CmdProcessor(char* Buf, uint32_t Len) {
+    uint32_t Cnt = 0;
     ECmdState CmdState = eStart;
     ECmdState NxtCmdState = CmdState;
     char CurCh = 0;
-    int CmdCode = 0;
+    uint32_t CmdCode = 0;
     // Protocol parser
     while (Cnt < Len) {
         CurCh = Buf[Cnt];
@@ -178,8 +240,12 @@ int CmdProcessor(char* Buf, int Len) {
                 GetFreqCmd();
                 return 0;
                 break;
+            case CMD_GET_FREQ_SEC:
+                GetFreqCmd();
+                return 0;
+                break;
             case CMD_GET_ADC:
-                GetAdcCmd();
+                GetPulseCntFreqCmd();
                 return 0;
                 break;
             default:
@@ -195,6 +261,7 @@ int CmdProcessor(char* Buf, int Len) {
     }
     return 0;
 }
+
 
 int main(int argc, char* argv[])
 {
@@ -219,8 +286,8 @@ int main(int argc, char* argv[])
     // simulation of one ADC sample
     // in assumption of symetric signal for hardware abstruction
     int16_t InBuf;
-    int Cnt = 0;
-    int Sample = 0;
+    uint32_t Cnt = 0;
+    int16_t Sample = 0;
     /*vector<int16_t> Values;
     while (AdcSmpls.read(reinterpret_cast<char*>(&InBuf), sizeof(int16_t)))
     {
@@ -254,8 +321,6 @@ int main(int argc, char* argv[])
         }
 
     }
-
-
 
     AdcSmpls.close();
 

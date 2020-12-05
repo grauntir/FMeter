@@ -1,13 +1,13 @@
 clc;
 clear all;
 % total count for generation
-N=100000;
+N=2000000;
 % amplitude of the signal
 A=4096;
 % absolute frequenc in Hz
-F=6;
+F=600;
 % sample frequncy in Hz
-Fd=10000;
+Fd=1000000;
 t=(0:N-1)/Fd;
 S=A*sin(1*pi+2*pi*F*t)
 fid=fopen('Data.bin', 'w');
